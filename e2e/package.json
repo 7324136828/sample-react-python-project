@@ -1,0 +1,17 @@
+{
+  "name": "sample-react-python-e2e",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "test": "playwright test",
+    "test:headed": "playwright test --headed",
+    "typecheck": "tsc --noEmit",
+    "install:webkit": "playwright install webkit"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.63.0",
+    "@types/node": "^26.5.1",
+    "typescript": "^7.0.2"
+  }
+}
