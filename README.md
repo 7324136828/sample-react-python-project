@@ -59,6 +59,48 @@ Interactive API documentation is available at the backend `/docs` URL.
 
 ## Tests and build
 
+Build a portable Windows distribution (requires Python 3.10+ and Node.js/npm
+on the build machine):
+
+```powershell
+.\build.bat
+# Equivalent: python build.py
+```
+
+The build installs dependencies in the active Python environment, or creates
+and uses the project `.venv`, then builds React and packages FastAPI with
+PyInstaller. Use `build.bat --skip-install` to reuse installed dependencies.
+
+```text
+dist/
+  public/                 Built frontend HTML, JavaScript, and CSS
+  server.exe              Standalone backend and frontend static server
+  run.bat                 Distribution launcher
+```
+
+Copy the entire `dist` folder to another Windows machine; Python and Node.js
+are not required there. Start it with:
+
+```powershell
+.\dist\run.bat
+.\dist\run.bat --frontend 4000 --backend 9000
+```
+
+The distribution defaults to frontend port `3000` and backend port `8000`.
+`--frontend-port` and `--backend-port` are also accepted. Ports must be distinct,
+available integers between 1 and 65535. Open the printed frontend URL, and
+press Ctrl+C in the launcher terminal to stop both services.
+
+The executable serves `public` and forwards frontend `/api` requests to the
+selected backend port, so changing ports does not require rebuilding React.
+An optional `dist/.env` supports `FRONTEND_PORT`, `BACKEND_PORT`, `BACKEND_HOST`,
+and `COUNTER_DB_PATH`; command-line ports take precedence. The counter database
+defaults to `dist/data/counter.db`. Relative database paths resolve beside
+`server.exe`, regardless of the launcher's working directory. Rebuilding
+replaces the three generated artifacts and preserves existing data and `.env`.
+
+Development checks:
+
 ```powershell
 python -m unittest discover -s backend\tests -v
 cd frontend
@@ -92,4 +134,5 @@ e2e/                      Standalone TypeScript Playwright end-to-end tests
 data/                     Runtime database location (database is ignored)
 setup.py / setup.*        Cross-platform dependency setup
 run.py / run.*            Combined backend/frontend runner
+build.py / build.bat      Portable Windows distribution builder
 ```
