@@ -44,7 +44,8 @@ class PackagedRuntimeTests(unittest.TestCase):
     def setUp(self) -> None:
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
-        self.settings_root = Path(directory.name)
+        # Match settings path normalization, including Windows short-name aliases.
+        self.settings_root = Path(directory.name).resolve()
         (self.settings_root / "temp").mkdir()
 
     def environment(self) -> dict[str, str]:
