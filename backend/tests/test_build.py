@@ -12,6 +12,7 @@ from build import (
     PROFILES,
     BuildError,
     checked_path,
+    main,
     prepare_artifacts,
     publish_artifacts,
     validate_artifacts,
@@ -34,6 +35,10 @@ def write_packages(directory: Path, version: str) -> None:
         (package / "runtime.json").write_text(
             json.dumps({"host": runtime_host}), encoding="ascii",
         )
+        ports = {"frontend_port": 4100, "backend_port": 9200}
+        if version != "new":
+            ports = {"frontend_port": 4300, "backend_port": 9400}
+        (package / "port_mapping.json").write_text(json.dumps(ports), encoding="ascii")
 
 
 def package_contents(directory: Path) -> dict[Path, bytes]:
@@ -55,8 +60,12 @@ class ArtifactPreparationTests(unittest.TestCase):
             (stage / "public" / "assets").mkdir(parents=True)
             (stage / "public" / "index.html").write_text("shared frontend", encoding="utf-8")
             (stage / "public" / "assets" / "app.js").write_bytes(b"shared script")
+            defaults = stage / "defaults.json"
+            defaults.write_text(
+                '{"frontend_port": 4100, "backend_port": 9200}\n', encoding="utf-8",
+            )
 
-            packages = prepare_artifacts(stage)
+            packages = prepare_artifacts(stage, defaults_path=defaults)
 
             self.assertEqual(packages, stage / "packages")
             self.assertEqual({path.name for path in packages.iterdir()}, {"Debug", "Release"})
@@ -68,6 +77,7 @@ class ArtifactPreparationTests(unittest.TestCase):
                     self.assertEqual((package / "server.exe").read_bytes(), b"shared backend")
                     self.assertEqual(package_contents(package / "public"), package_contents(stage / "public"))
                     self.assertEqual((package / "run.bat").read_text(encoding="ascii"), LAUNCHER)
+                    self.assertEqual((package / "port_mapping.json").read_bytes(), defaults.read_bytes())
                     self.assertEqual(
                         json.loads((package / "runtime.json").read_text(encoding="ascii")),
                         {"host": expected_host},
@@ -76,12 +86,51 @@ class ArtifactPreparationTests(unittest.TestCase):
 
             # Each mode remains usable after the shared staging files or the other mode change.
             (stage / "server.exe").unlink()
+            defaults.unlink()
             (packages / "Debug" / "public" / "index.html").write_text("changed", encoding="utf-8")
             self.assertEqual((packages / "Release" / "server.exe").read_bytes(), b"shared backend")
             self.assertEqual(
                 (packages / "Release" / "public" / "index.html").read_text(encoding="utf-8"),
                 "shared frontend",
             )
+            self.assertEqual(
+                json.loads((packages / "Release" / "port_mapping.json").read_text(encoding="utf-8")),
+                {"frontend_port": 4100, "backend_port": 9200},
+            )
+
+    def test_launcher_initializes_settings_before_starting_servers(self) -> None:
+        initialize = '"%~dp0server.exe" --initialize-settings\n'
+        abort_on_failure = "if errorlevel 1 exit /b %ERRORLEVEL%\n"
+        launch = ':launch\n"%~dp0server.exe" %*\n'
+        self.assertIn(initialize + abort_on_failure + launch, LAUNCHER)
+        for flag in ("--help", "-h"):
+            help_bypass = f'if /i "%~1"=="{flag}" if "%~2"=="" goto launch\n'
+            self.assertLess(LAUNCHER.index(help_bypass), LAUNCHER.index(initialize))
+
+    def test_preparation_rejects_missing_or_invalid_port_defaults_before_creating_packages(self) -> None:
+        for contents in (None, "{}", "not json", '{"frontend_port": 0, "backend_port": 9200}'):
+            with self.subTest(contents=contents), tempfile.TemporaryDirectory() as directory:
+                stage = Path(directory)
+                defaults = stage / "defaults.json"
+                if contents is not None:
+                    defaults.write_text(contents, encoding="utf-8")
+                with self.assertRaisesRegex(BuildError, "Invalid port defaults"):
+                    prepare_artifacts(stage, defaults_path=defaults)
+                self.assertFalse((stage / "packages").exists())
+
+    def test_build_rejects_invalid_port_defaults_before_installing_dependencies(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            missing_defaults = Path(directory) / "missing.json"
+            with (
+                mock.patch("build.os.name", "nt"),
+                mock.patch("build.PORT_MAPPING", missing_defaults),
+                mock.patch("build.run") as run,
+                mock.patch("build.select_python") as select_python,
+            ):
+                with self.assertRaisesRegex(BuildError, "Invalid port defaults"):
+                    main([])
+                run.assert_not_called()
+                select_python.assert_not_called()
 
     def test_validation_rejects_an_incorrect_runtime_default(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -89,6 +138,19 @@ class ArtifactPreparationTests(unittest.TestCase):
             write_packages(packages, "new")
             with self.assertRaisesRegex(BuildError, "Unexpected runtime defaults"):
                 validate_artifacts(packages / "Debug", host="0.0.0.0")
+
+    def test_validation_rejects_missing_or_invalid_packaged_port_defaults(self) -> None:
+        for contents in (None, "{}", "[]", '{"frontend_port": 4100, "backend_port": "9200"}'):
+            with self.subTest(contents=contents), tempfile.TemporaryDirectory() as directory:
+                packages = Path(directory)
+                write_packages(packages, "new")
+                defaults = packages / "Debug" / "port_mapping.json"
+                if contents is None:
+                    defaults.unlink()
+                else:
+                    defaults.write_text(contents, encoding="utf-8")
+                with self.assertRaisesRegex(BuildError, "Invalid port defaults"):
+                    validate_artifacts(packages / "Debug", host=PROFILES["Debug"])
 
 
 class PublicationTests(unittest.TestCase):

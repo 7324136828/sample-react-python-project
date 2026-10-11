@@ -82,6 +82,23 @@ Its `data_directory` setting defaults to the resolved
 there as `counter.db`. Development, Debug, and Release use the same settings
 and data for the current Windows user.
 
+Portable Debug and Release launchers also read `frontend_port` and
+`backend_port` from this file. Before starting either service, `run.bat` creates
+an empty JSON object (`{}`) if the file is absent and fills only missing port
+fields from the `port_mapping.json` included beside `server.exe`. The build
+copies that file from the project root into both distributions. The current
+project defaults are frontend `3100` and backend `3200`. Existing ports,
+storage settings, and other fields are preserved. Edit the settings file and
+restart the launcher to change ports:
+
+```json
+{
+  "frontend_port": 4100,
+  "backend_port": 4200,
+  "data_directory": "D:/CounterData"
+}
+```
+
 To choose a storage folder, edit `settings.json` and restart the application:
 
 ```json
@@ -152,11 +169,13 @@ dist/
     server.exe            Standalone backend and frontend static server
     run.bat               Distribution launcher
     runtime.json          Generated default bind address
+    port_mapping.json     Project defaults for missing settings ports
   Release/                LAN version (default host: 0.0.0.0)
     public/
     server.exe
     run.bat
     runtime.json
+    port_mapping.json
 ```
 
 Both folders contain the same packaged application, with different default
@@ -170,7 +189,8 @@ are not required there. Start it with:
 .\dist\Release\run.bat --frontend 4000 --backend 9000
 ```
 
-Both distributions default to frontend port `3000` and backend port `8000`.
+Both distributions use the ports saved in the per-user `settings.json`,
+initializing missing fields from their included `port_mapping.json`.
 Debug binds to `127.0.0.1` for local access; Release binds to `0.0.0.0` for LAN
 access.
 `--frontend-port` and `--backend-port` are also accepted. Ports must be distinct,
@@ -180,14 +200,18 @@ press Ctrl+C in the launcher terminal to stop both services.
 The executable serves `public` and forwards frontend `/api` requests to the
 selected backend port, so changing ports does not require rebuilding React.
 An optional `.env` beside each `server.exe` supports `FRONTEND_PORT`,
-`BACKEND_PORT`, `BACKEND_HOST`, and `COUNTER_DB_PATH`; command-line ports take
-precedence. For the bind address, `--host` takes precedence over `BACKEND_HOST`,
+`BACKEND_PORT`, `BACKEND_HOST`, and `COUNTER_DB_PATH`. Command-line ports take
+precedence over environment variables, which take precedence over the saved
+settings ports. Overrides apply to that launch and do not change saved ports.
+Invalid JSON, missing or invalid mapping defaults, or invalid saved port values
+stop startup with an error. For the bind address, `--host` takes precedence
+over `BACKEND_HOST`,
 which takes precedence over the generated `runtime.json` default. Both
 distributions use the per-user `settings.json` and data directory described
 above. Relative `COUNTER_DB_PATH` overrides resolve beside `server.exe`,
 regardless of the launcher's working directory. Rebuilding replaces `public`,
-`server.exe`, `run.bat`, and `runtime.json` while preserving each folder's `.env`
-and any existing data files.
+`server.exe`, `run.bat`, `runtime.json`, and `port_mapping.json` while preserving
+each folder's `.env` and any existing data files.
 
 Development checks:
 

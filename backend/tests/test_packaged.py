@@ -9,7 +9,7 @@ import sys
 import tempfile
 import time
 import unittest
-from contextlib import contextmanager, redirect_stdout
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -64,10 +64,14 @@ class PackagedRuntimeTests(unittest.TestCase):
         return [sys.executable, "-c", ENTRYPOINT, str(PROJECT_ROOT), str(root), *arguments]
 
     @contextmanager
-    def running(self, root: Path, frontend: int, backend: int, *, cwd: Path | None = None):
+    def running(
+        self, root: Path, frontend: int, backend: int, *, cwd: Path | None = None,
+        use_cli_ports: bool = True,
+    ):
+        arguments = ["--frontend", str(frontend), "--backend-port", str(backend)] if use_cli_ports else []
         with tempfile.TemporaryFile(mode="w+b") as log:
             process = subprocess.Popen(
-                self.command(root, "--frontend", str(frontend), "--backend-port", str(backend)),
+                self.command(root, *arguments),
                 cwd=cwd or root, env=self.environment(), stdout=log, stderr=subprocess.STDOUT,
                 creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
             )
@@ -97,7 +101,16 @@ class PackagedRuntimeTests(unittest.TestCase):
                         process.kill()
                         process.wait(timeout=5)
 
+    def make_mapping(self, root: Path, frontend: int = 3000, backend: int = 8000) -> Path:
+        path = root / "port_mapping.json"
+        path.write_text(json.dumps({"frontend_port": frontend, "backend_port": backend}), encoding="utf-8")
+        return path
+
+    def settings_file(self) -> Path:
+        return self.settings_root / "appdata" / "sample-react-python-project" / "settings.json"
+
     def make_public(self, root: Path) -> None:
+        self.make_mapping(root)
         (root / "public").mkdir()
         (root / "public" / "index.html").write_text("<h1>Portable frontend</h1>")
         (root / ".env").write_text("COUNTER_DB_PATH=data/portable.db\n")
@@ -132,6 +145,43 @@ class PackagedRuntimeTests(unittest.TestCase):
                     packaged.parse_args([], default_host="127.0.0.1").host, "192.168.1.156",
                 )
                 self.assertEqual(packaged.parse_args(["--host", "127.0.0.1"]).host, "127.0.0.1")
+
+    def test_port_precedence_is_cli_then_environment_then_settings(self) -> None:
+        root = self.settings_root
+        mapping = self.make_mapping(root)
+        settings = self.settings_file()
+        settings.parent.mkdir(parents=True)
+        original = json.dumps({"frontend_port": 4100, "backend_port": 4200, "custom_setting": "preserved"})
+        settings.write_text(original, encoding="utf-8")
+        for environment_ports, arguments, expected in (
+            ({}, [], (4100, 4200)),
+            ({"FRONTEND_PORT": "5100"}, [], (5100, 4200)),
+            ({"BACKEND_PORT": "5200"}, [], (4100, 5200)),
+            ({"FRONTEND_PORT": "5100", "BACKEND_PORT": "5200"}, [], (5100, 5200)),
+            ({"FRONTEND_PORT": "5100", "BACKEND_PORT": "5200"},
+             ["--frontend", "6100", "--backend-port", "6200"], (6100, 6200)),
+        ):
+            with self.subTest(environment=environment_ports, arguments=arguments), patch.dict(
+                os.environ, {**self.environment(), **environment_ports}, clear=True,
+            ):
+                options = packaged.parse_args(arguments, defaults_path=mapping)
+                self.assertEqual((options.frontend_port, options.backend_port), expected)
+                self.assertEqual(settings.read_text(encoding="utf-8"), original)
+
+    def test_effective_environment_and_cli_ports_are_validated(self) -> None:
+        mapping = self.make_mapping(self.settings_root)
+        for environment_ports, arguments in (
+            ({"FRONTEND_PORT": "0"}, []),
+            ({"BACKEND_PORT": "65536"}, []),
+            ({"FRONTEND_PORT": "abc"}, []),
+            ({"FRONTEND_PORT": "8000"}, []),
+            ({"BACKEND_PORT": "4100"}, ["--frontend", "4100"]),
+        ):
+            with self.subTest(environment=environment_ports, arguments=arguments), patch.dict(
+                os.environ, {**self.environment(), **environment_ports}, clear=True,
+            ), redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as raised:
+                packaged.parse_args(arguments, defaults_path=mapping)
+            self.assertEqual(raised.exception.code, 2)
 
     def test_runtime_profile_defaults_and_validation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -329,6 +379,7 @@ class PackagedRuntimeTests(unittest.TestCase):
                 self.assertEqual(client.get(url).json()["count"], 0)
                 self.assertEqual(client.post(url + "/click").json()["count"], 1)
             original_settings = settings.read_text(encoding="utf-8")
+            self.assertEqual(json.loads(original_settings), {"frontend_port": 3000, "backend_port": 8000})
             self.assertTrue(database.is_file())
             self.assertFalse((root / "data").exists())
 
@@ -361,7 +412,115 @@ class PackagedRuntimeTests(unittest.TestCase):
                     if expected_count == 0:
                         self.assertEqual(client.post(url + "/click").json()["count"], 1)
             self.assertTrue((storage / "counter.db").is_file())
-            self.assertEqual(settings.read_text(encoding="utf-8"), content)
+            self.assertEqual(json.loads(settings.read_text(encoding="utf-8")), {
+                "data_directory": str(storage), "custom_setting": "preserved",
+                "frontend_port": 3000, "backend_port": 8000,
+            })
+
+    def test_settings_ports_start_frontend_backend_and_proxy_without_cli(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_public(root)
+            frontend, backend = free_ports()
+            settings = self.settings_file()
+            settings.parent.mkdir(parents=True)
+            original = json.dumps({
+                "frontend_port": frontend, "backend_port": backend,
+                "custom_setting": "preserved",
+            })
+            settings.write_text(original, encoding="utf-8")
+            with self.running(root, frontend, backend, use_cli_ports=False) as client:
+                frontend_url = f"http://127.0.0.1:{frontend}"
+                backend_url = f"http://127.0.0.1:{backend}"
+                self.assertIn("Portable frontend", client.get(frontend_url).text)
+                self.assertEqual(client.get(backend_url + "/api/health").json(), {"status": "ok"})
+                self.assertEqual(client.post(frontend_url + "/api/counter/click").json()["count"], 1)
+                self.assertEqual(client.get(backend_url + "/api/counter").json()["count"], 1)
+            self.assertEqual(settings.read_text(encoding="utf-8"), original)
+
+    def test_partial_settings_fill_only_missing_ports_and_start_services(self) -> None:
+        for missing in ("frontend_port", "backend_port", "both"):
+            with self.subTest(missing=missing), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                self.make_public(root)
+                frontend, backend = free_ports()
+                # The populated port deliberately differs from the corresponding
+                # distribution default so startup proves it was preserved.
+                if missing == "frontend_port":
+                    self.make_mapping(root, frontend, 8000)
+                    configured = {"backend_port": backend}
+                elif missing == "backend_port":
+                    self.make_mapping(root, 3000, backend)
+                    configured = {"frontend_port": frontend}
+                else:
+                    self.make_mapping(root, frontend, backend)
+                    configured = {}
+                configured["custom_setting"] = "preserved"
+                settings = self.settings_file()
+                settings.parent.mkdir(parents=True, exist_ok=True)
+                settings.write_text(json.dumps(configured), encoding="utf-8")
+                with self.running(root, frontend, backend, use_cli_ports=False) as client:
+                    self.assertEqual(
+                        client.get(f"http://127.0.0.1:{backend}/api/health").json(),
+                        {"status": "ok"},
+                    )
+                    self.assertIn("Portable frontend", client.get(f"http://127.0.0.1:{frontend}").text)
+                self.assertEqual(json.loads(settings.read_text(encoding="utf-8")), {
+                    "frontend_port": frontend, "backend_port": backend,
+                    "custom_setting": "preserved",
+                })
+
+    def test_initialize_settings_needs_no_frontend_and_opens_no_ports(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, socket.socket() as frontend, socket.socket() as backend:
+            root = Path(directory)
+            frontend.bind(("127.0.0.1", 0))
+            backend.bind(("127.0.0.1", 0))
+            frontend.listen()
+            backend.listen()
+            expected = {
+                "frontend_port": frontend.getsockname()[1],
+                "backend_port": backend.getsockname()[1],
+            }
+            self.make_mapping(root, expected["frontend_port"], expected["backend_port"])
+            completed = subprocess.run(
+                self.command(root, "--initialize-settings"), cwd=root, env=self.environment(),
+                capture_output=True, text=True, timeout=15,
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertNotIn("Starting Sample", completed.stdout)
+            self.assertEqual(json.loads(self.settings_file().read_text(encoding="utf-8")), expected)
+            self.assertFalse((self.settings_root / "temp" / "sample-react-python-project").exists())
+            self.assertFalse((root / "public").exists())
+
+            # Initialization is idempotent and does not rewrite unrelated settings.
+            preserved = json.dumps({**expected, "custom_setting": "preserved"})
+            self.settings_file().write_text(preserved, encoding="utf-8")
+            completed = subprocess.run(
+                self.command(root, "--initialize-settings"), cwd=root, env=self.environment(),
+                capture_output=True, text=True, timeout=15,
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(self.settings_file().read_text(encoding="utf-8"), preserved)
+
+    def test_invalid_or_missing_port_mapping_fails_before_service_startup(self) -> None:
+        for content in (None, "{", "[]", '{"frontend_port": 3000}'):
+            with self.subTest(content=content), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                mapping = root / "port_mapping.json"
+                if content is not None:
+                    mapping.write_text(content, encoding="utf-8")
+                completed = subprocess.run(
+                    self.command(root), cwd=root, env=self.environment(),
+                    capture_output=True, text=True, timeout=15,
+                    creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+                )
+                self.assertEqual(completed.returncode, 1)
+                self.assertIn(str(mapping), completed.stderr)
+                self.assertNotIn("Frontend is missing", completed.stderr)
+                self.assertNotIn("Traceback", completed.stderr)
+                self.assertNotIn("Starting Sample", completed.stdout)
 
     def test_invalid_settings_report_clear_error_and_release_ports(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -379,6 +538,7 @@ class PackagedRuntimeTests(unittest.TestCase):
             self.assertEqual(completed.returncode, 1)
             self.assertIn(str(settings), completed.stderr)
             self.assertNotIn("Traceback", completed.stderr)
+            self.assertNotIn("Starting Sample", completed.stdout)
             self.assertEqual(settings.read_text(encoding="utf-8"), "{")
             for port in (frontend, backend):
                 with socket.socket() as released:
@@ -415,6 +575,7 @@ class PackagedRuntimeTests(unittest.TestCase):
 
     def test_invalid_and_duplicate_ports_are_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
+            self.make_mapping(Path(directory))
             for arguments in (("--frontend", "0"), ("--backend", "65536"),
                               ("--backend", "abc"), ("--frontend", "8000")):
                 with self.subTest(arguments=arguments):

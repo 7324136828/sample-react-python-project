@@ -34,8 +34,8 @@ def default_data_directory() -> Path:
     return root.expanduser().resolve() / APP_NAME
 
 
-def _create_default_settings(path: Path, data_directory: Path) -> None:
-    # Publish complete JSON without replacing a file another startup created.
+def _write_json(path: Path, values: dict, *, overwrite: bool = False) -> None:
+    # Publish complete JSON so another startup never reads a partial file.
     temporary_path: Path | None = None
     try:
         with tempfile.NamedTemporaryFile(
@@ -43,8 +43,11 @@ def _create_default_settings(path: Path, data_directory: Path) -> None:
             prefix=".settings-", suffix=".tmp", delete=False,
         ) as settings_file:
             temporary_path = Path(settings_file.name)
-            json.dump({"data_directory": str(data_directory)}, settings_file, indent=2)
+            json.dump(values, settings_file, indent=2)
             settings_file.write("\n")
+        if overwrite:
+            temporary_path.replace(path)
+            return
         try:
             if os.name == "nt":
                 # Windows rename fails if the destination already exists.
@@ -56,6 +59,68 @@ def _create_default_settings(path: Path, data_directory: Path) -> None:
     finally:
         if temporary_path is not None:
             temporary_path.unlink(missing_ok=True)
+
+
+def _create_default_settings(path: Path, data_directory: Path) -> None:
+    _write_json(path, {"data_directory": str(data_directory)})
+
+
+def _read_json_object(path: Path) -> dict:
+    try:
+        values = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise SettingsError(f"Cannot read configuration at {path}: {error}") from error
+    if not isinstance(values, dict):
+        raise SettingsError(f"Invalid configuration at {path}: expected a JSON object")
+    return values
+
+
+def _validate_ports(values: dict, path: Path) -> dict[str, int]:
+    ports: dict[str, int] = {}
+    for field in ("frontend_port", "backend_port"):
+        if field not in values:
+            raise SettingsError(f"Invalid configuration at {path}: missing {field}")
+        value = values[field]
+        if type(value) is not int or not 1 <= value <= 65535:
+            raise SettingsError(
+                f"Invalid configuration at {path}: {field} must be an integer from 1 to 65535"
+            )
+        ports[field] = value
+    if ports["frontend_port"] == ports["backend_port"]:
+        raise SettingsError(
+            f"Invalid configuration at {path}: frontend_port and backend_port must be different"
+        )
+    return ports
+
+
+def load_port_mapping(path: Path) -> dict[str, int]:
+    """Read and validate the project's default frontend and backend ports."""
+    return _validate_ports(_read_json_object(path), path)
+
+
+def initialize_port_settings(defaults_path: Path) -> dict[str, int]:
+    """Persist missing port defaults, then read the effective per-user ports."""
+    defaults = load_port_mapping(defaults_path)
+    path = settings_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if not path.exists():
+            _write_json(path, {})
+    except OSError as error:
+        raise SettingsError(f"Cannot create settings at {path}: {error}") from error
+
+    values = _read_json_object(path)
+    missing = [field for field in defaults if field not in values]
+    for field in missing:
+        values[field] = defaults[field]
+    # Validate before updating so invalid existing ports are never replaced.
+    _validate_ports(values, path)
+    if missing:
+        try:
+            _write_json(path, values, overwrite=True)
+        except OSError as error:
+            raise SettingsError(f"Cannot update port settings at {path}: {error}") from error
+    return _validate_ports(_read_json_object(path), path)
 
 
 def load_settings() -> AppSettings:
