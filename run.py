@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import os
 import shutil
 import socket
@@ -11,6 +12,8 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+
+from backend.network import lan_urls_for_host
 
 ROOT = Path(__file__).resolve().parent
 FRONTEND = ROOT / "frontend"
@@ -65,21 +68,47 @@ def parse_port(value: str | int, label: str) -> int:
     return port
 
 
-def available_port(start: int, reserved: set[int] | None = None) -> int:
+def resolve_host(host: str) -> tuple[int, str]:
+    try:
+        addresses = socket.getaddrinfo(host, 0, type=socket.SOCK_STREAM)
+    except OSError as error:
+        raise RunError(f"Cannot resolve bind address {host!r}: {error}") from error
+    family, _, _, _, address = addresses[0]
+    return family, address[0]
+
+
+def available_port(
+    start: int, reserved: set[int] | None = None, *,
+    host: str = "127.0.0.1", family: int = socket.AF_INET,
+) -> int:
     reserved = reserved or set()
     for port in range(start, 65536):
         if port in reserved:
             continue
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        with socket.socket(family, socket.SOCK_STREAM) as probe:
             try:
-                probe.bind(("127.0.0.1", port))
-            except OSError:
-                continue
+                if os.name == "nt":
+                    probe.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+                probe.bind((host, port))
+            except OSError as error:
+                if error.errno in (errno.EADDRINUSE, errno.EACCES):
+                    continue
+                raise RunError(f"Cannot bind to {host}:{port}: {error}") from error
         return port
     raise RunError(f"No available TCP port was found at or above {start}")
 
 
-def merge_cors_origins(environment: dict[str, str], frontend_port: int) -> None:
+def service_url(host: str, port: int) -> str:
+    host = {"0.0.0.0": "127.0.0.1", "::": "::1"}.get(host, host)
+    if ":" in host:
+        host = f"[{host}]"
+    return f"http://{host}:{port}"
+
+
+def merge_cors_origins(
+    environment: dict[str, str], frontend_port: int,
+    extra_origins: list[str] | None = None,
+) -> None:
     current = environment.get("CORS_ORIGINS", "")
     if current.strip() == "*":
         return
@@ -87,6 +116,7 @@ def merge_cors_origins(environment: dict[str, str], frontend_port: int) -> None:
     for origin in (
         f"http://localhost:{frontend_port}",
         f"http://127.0.0.1:{frontend_port}",
+        *(extra_origins or []),
     ):
         if origin not in origins:
             origins.append(origin)
@@ -104,13 +134,15 @@ def stop(process: subprocess.Popen[bytes] | None) -> None:
         process.wait(timeout=5)
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--backend-port", type=int, help="first backend port to try")
     parser.add_argument("--frontend-port", type=int, help="first frontend port to try")
-    parser.add_argument("--host", help="backend bind address")
+    parser.add_argument(
+        "--host", help="bind address for both services (default: BACKEND_HOST or 0.0.0.0)",
+    )
     parser.add_argument("--no-reload", action="store_true", help="disable backend reload")
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def main() -> int:
@@ -128,14 +160,23 @@ def main() -> int:
         args.frontend_port or os.environ.get("FRONTEND_PORT", "5173"),
         "frontend port",
     )
-    backend_port = available_port(requested_backend)
-    frontend_port = available_port(requested_frontend, {backend_port})
-    host = args.host or os.environ.get("BACKEND_HOST", "127.0.0.1")
-    backend_url = f"http://127.0.0.1:{backend_port}"
-    frontend_url = f"http://localhost:{frontend_port}"
+    family, host = resolve_host(args.host or os.environ.get("BACKEND_HOST", "0.0.0.0"))
+    backend_port = available_port(requested_backend, host=host, family=family)
+    frontend_port = available_port(
+        requested_frontend, {backend_port}, host=host, family=family,
+    )
+    backend_url = service_url(host, backend_port)
+    frontend_url = (
+        f"http://localhost:{frontend_port}" if host == "0.0.0.0"
+        else service_url(host, frontend_port)
+    )
+    frontend_lan_urls = lan_urls_for_host(host, frontend_port)
+    backend_lan_urls = [
+        f"{url.rsplit(':', 1)[0]}:{backend_port}" for url in frontend_lan_urls
+    ]
 
     backend_env = os.environ.copy()
-    merge_cors_origins(backend_env, frontend_port)
+    merge_cors_origins(backend_env, frontend_port, [frontend_url, *frontend_lan_urls])
     frontend_env = os.environ.copy()
     frontend_env["VITE_BACKEND_URL"] = backend_url
 
@@ -150,10 +191,15 @@ def main() -> int:
     if frontend_port != requested_frontend:
         print(f"[run] Frontend port {requested_frontend} is busy; using {frontend_port}.")
     print("=" * 62)
-    print("Sample React + Python Project")
+    print("Starting Sample React + Python Full-Stack Services")
     print(f"Python:   {sys.executable}")
-    print(f"Backend:  {backend_url} (docs: {backend_url}/docs)")
+    print(f"Backend:  {backend_url} (API docs: {backend_url}/docs)")
     print(f"Frontend: {frontend_url}")
+    for frontend_lan_url, backend_lan_url in zip(frontend_lan_urls, backend_lan_urls):
+        print(f"LAN:      {frontend_lan_url}")
+        print(f"LAN API:  {backend_lan_url}/docs")
+    if frontend_lan_urls:
+        print("Open a LAN URL on another device connected to the same network.")
     print("Press Ctrl+C to stop both services.")
     print("=" * 62, flush=True)
 
@@ -174,6 +220,8 @@ def main() -> int:
         "run",
         "dev",
         "--",
+        "--host",
+        host,
         "--port",
         str(frontend_port),
         "--strictPort",

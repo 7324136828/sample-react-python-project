@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import os
 import signal
 import socket
@@ -11,6 +12,7 @@ import sys
 from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 from typing import Iterator
+from urllib.parse import urlsplit
 
 import httpx
 import uvicorn
@@ -55,6 +57,21 @@ def load_environment(root: Path) -> None:
     os.environ["COUNTER_DB_PATH"] = str(database.resolve())
 
 
+def runtime_host(root: Path) -> str:
+    profile_path = root / "runtime.json"
+    if not profile_path.exists():
+        return "0.0.0.0"
+    try:
+        profile = json.loads(profile_path.read_text(encoding="utf-8-sig"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise RunError(f"Cannot read runtime profile at {profile_path}: {error}") from error
+    if not isinstance(profile, dict) or profile.get("host") not in ("127.0.0.1", "0.0.0.0"):
+        raise RunError(
+            f"Invalid runtime profile at {profile_path}: host must be 127.0.0.1 or 0.0.0.0"
+        )
+    return profile["host"]
+
+
 def port_number(value: str) -> int:
     try:
         port = int(value)
@@ -65,7 +82,9 @@ def port_number(value: str) -> int:
     return port
 
 
-def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+def parse_args(
+    argv: list[str] | None = None, *, default_host: str = "0.0.0.0",
+) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--frontend", "--frontend-port", dest="frontend_port", type=port_number,
@@ -78,8 +97,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="backend port (default: BACKEND_PORT or 8000)",
     )
     parser.add_argument(
-        "--host", default=os.environ.get("BACKEND_HOST", "127.0.0.1"),
-        help="bind address for both services (default: BACKEND_HOST or 127.0.0.1)",
+        "--host", default=os.environ.get("BACKEND_HOST", default_host),
+        help="bind address for both services (default: BACKEND_HOST or runtime profile)",
     )
     options = parser.parse_args(argv)
     if options.frontend_port == options.backend_port:
@@ -248,7 +267,7 @@ async def serve_applications(
 def main(argv: list[str] | None = None) -> int:
     root = runtime_directory()
     load_environment(root)
-    options = parse_args(argv)
+    options = parse_args(argv, default_host=runtime_host(root))
     public = root / "public"
     if not (public / "index.html").is_file():
         raise RunError(f"Frontend is missing at {public}; rebuild with build.bat")
@@ -260,13 +279,25 @@ def main(argv: list[str] | None = None) -> int:
         if not getattr(sys, "frozen", False):
             sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
         from backend.app.main import app
+        from backend.network import lan_urls
 
         backend_url = listener_url(backend_socket)
         frontend_url = listener_url(frontend_socket)
         frontend = create_frontend_app(public, backend_url)
-        print(f"[run] Frontend: {frontend_url}")
-        print(f"[run] Backend:  {backend_url} (docs: {backend_url}/docs)")
-        print(f"[run] Database: {os.environ['COUNTER_DB_PATH']}")
+        print("Starting Sample React + Python Full-Stack Services")
+        print(f"Python:   {sys.executable}")
+        print(f"Backend:  {backend_url} (API docs: {backend_url}/docs)")
+        print(f"Frontend: {frontend_url}")
+        backend_lan_urls = {urlsplit(url).hostname: url for url in lan_urls(backend_socket)}
+        frontend_lan_urls = lan_urls(frontend_socket)
+        for url in frontend_lan_urls:
+            print(f"LAN:      {url}")
+            api_url = backend_lan_urls.get(urlsplit(url).hostname)
+            if api_url is not None:
+                print(f"LAN API:  {api_url}/docs")
+        if frontend_lan_urls:
+            print("Open a LAN URL on another device connected to the same network.")
+        print(f"Database: {os.environ['COUNTER_DB_PATH']}")
         print("[run] Press Ctrl+C to stop both services.", flush=True)
         return asyncio.run(serve_applications(app, frontend, backend_socket, frontend_socket))
     finally:

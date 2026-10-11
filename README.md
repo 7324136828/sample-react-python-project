@@ -33,6 +33,46 @@ The default backend and frontend ports are `8000` and `5173`. The runner checks
 both ports before launch and advances to the next available port when needed.
 It prints the actual URLs selected for the session.
 
+## LAN access
+
+The development runner and portable Windows Release build listen on `0.0.0.0`
+by default, making the frontend and API available on the host's network
+interfaces. Start either launcher and open a printed `LAN` frontend URL on
+another device connected to the same network. The Debug build defaults to
+`127.0.0.1` for local-only access:
+
+```powershell
+.\run.bat
+# Or, after building:
+.\dist\Release\run.bat --frontend 4000 --backend 9000
+```
+
+Startup lists each detected IPv4 address with the selected ports, for example:
+
+```text
+Starting Sample React + Python Full-Stack Services
+Backend:  http://127.0.0.1:9000 (API docs: http://127.0.0.1:9000/docs)
+Frontend: http://localhost:4000
+LAN:      http://192.168.1.156:4000
+LAN API:  http://192.168.1.156:9000/docs
+LAN:      http://192.168.56.1:4000
+LAN API:  http://192.168.56.1:9000/docs
+Open a LAN URL on another device connected to the same network.
+```
+
+Use the address of the adapter connected to your other device; virtual-machine
+adapters may also appear. The frontend forwards `/api` requests to the backend
+on the host, so remote browsers work without IP-specific frontend configuration.
+If Windows Firewall blocks access, allow the running Python interpreter or
+`server.exe` on your private network. Wi-Fi guest networks or client isolation
+can also prevent devices from reaching each other.
+
+For local-only access, use `--host 127.0.0.1` with either launcher or set
+`BACKEND_HOST=127.0.0.1` in the relevant `.env`. To bind a specific adapter,
+use `--host 192.168.1.156` (replace it with your host's address). Command-line
+`--host` takes precedence over `BACKEND_HOST`. Existing `.env` files retain
+their settings; change an existing loopback value to `0.0.0.0` to enable LAN.
+
 ## Configuration
 
 Copy `.env.example` to `.env` to customize the preferred ports, bind address,
@@ -43,7 +83,7 @@ precedence over values in `.env`.
 | --- | --- | --- |
 | `BACKEND_PORT` | `8000` | First backend port to try |
 | `FRONTEND_PORT` | `5173` | First frontend port to try |
-| `BACKEND_HOST` | `127.0.0.1` | Backend bind address |
+| `BACKEND_HOST` | `0.0.0.0` | Bind address for both frontend and backend |
 | `COUNTER_DB_PATH` | `data/counter.db` | Persistent SQLite database |
 
 ## API
@@ -73,31 +113,47 @@ PyInstaller. Use `build.bat --skip-install` to reuse installed dependencies.
 
 ```text
 dist/
-  public/                 Built frontend HTML, JavaScript, and CSS
-  server.exe              Standalone backend and frontend static server
-  run.bat                 Distribution launcher
+  Debug/                  Local version (default host: 127.0.0.1)
+    public/               Built frontend HTML, JavaScript, and CSS
+    server.exe            Standalone backend and frontend static server
+    run.bat               Distribution launcher
+    runtime.json          Generated default bind address
+  Release/                LAN version (default host: 0.0.0.0)
+    public/
+    server.exe
+    run.bat
+    runtime.json
 ```
 
-Copy the entire `dist` folder to another Windows machine; Python and Node.js
+Both folders contain the same packaged application, with different default
+bind addresses selected by their generated `runtime.json` files. Copy the entire
+chosen `Debug` or `Release` folder to another Windows machine; Python and Node.js
 are not required there. Start it with:
 
 ```powershell
-.\dist\run.bat
-.\dist\run.bat --frontend 4000 --backend 9000
+.\dist\Debug\run.bat
+.\dist\Release\run.bat
+.\dist\Release\run.bat --frontend 4000 --backend 9000
 ```
 
-The distribution defaults to frontend port `3000` and backend port `8000`.
+Both distributions default to frontend port `3000` and backend port `8000`.
+Debug binds to `127.0.0.1` for local access; Release binds to `0.0.0.0` for LAN
+access.
 `--frontend-port` and `--backend-port` are also accepted. Ports must be distinct,
 available integers between 1 and 65535. Open the printed frontend URL, and
 press Ctrl+C in the launcher terminal to stop both services.
 
 The executable serves `public` and forwards frontend `/api` requests to the
 selected backend port, so changing ports does not require rebuilding React.
-An optional `dist/.env` supports `FRONTEND_PORT`, `BACKEND_PORT`, `BACKEND_HOST`,
-and `COUNTER_DB_PATH`; command-line ports take precedence. The counter database
-defaults to `dist/data/counter.db`. Relative database paths resolve beside
-`server.exe`, regardless of the launcher's working directory. Rebuilding
-replaces the three generated artifacts and preserves existing data and `.env`.
+An optional `.env` beside each `server.exe` supports `FRONTEND_PORT`,
+`BACKEND_PORT`, `BACKEND_HOST`, and `COUNTER_DB_PATH`; command-line ports take
+precedence. For the bind address, `--host` takes precedence over `BACKEND_HOST`,
+which takes precedence over the generated `runtime.json` default. The counter
+database defaults to `data/counter.db` in each distribution folder. Relative
+database paths resolve beside `server.exe`, regardless of the launcher's working
+directory. Each folder has separate settings and counter data. Rebuilding
+replaces `public`, `server.exe`, `run.bat`, and `runtime.json` while preserving
+each folder's existing data and `.env`.
 
 Development checks:
 

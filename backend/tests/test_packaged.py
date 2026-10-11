@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import io
+import json
 import os
 import socket
 import subprocess
@@ -7,10 +9,14 @@ import sys
 import tempfile
 import time
 import unittest
-from contextlib import contextmanager
+from contextlib import contextmanager, redirect_stdout
 from pathlib import Path
+from unittest.mock import Mock, patch
 
 import httpx
+
+from backend import packaged
+from backend.network import discover_lan_ipv4
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 ENTRYPOINT = """
@@ -82,6 +88,177 @@ class PackagedRuntimeTests(unittest.TestCase):
         (root / "public").mkdir()
         (root / "public" / "index.html").write_text("<h1>Portable frontend</h1>")
         (root / ".env").write_text("COUNTER_DB_PATH=data/portable.db\n")
+
+    def test_default_lan_and_explicit_bind_configuration(self) -> None:
+        with patch.dict(os.environ, self.environment(), clear=True):
+            self.assertEqual(packaged.parse_args([]).host, "0.0.0.0")
+            self.assertEqual(packaged.parse_args([], default_host="127.0.0.1").host, "127.0.0.1")
+            self.assertEqual(packaged.parse_args(["--host", "127.0.0.1"]).host, "127.0.0.1")
+            with patch.dict(os.environ, {"BACKEND_HOST": "192.168.1.156"}):
+                self.assertEqual(packaged.parse_args([]).host, "192.168.1.156")
+                self.assertEqual(
+                    packaged.parse_args([], default_host="127.0.0.1").host, "192.168.1.156",
+                )
+                self.assertEqual(packaged.parse_args(["--host", "127.0.0.1"]).host, "127.0.0.1")
+
+    def test_runtime_profile_defaults_and_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            profile = root / "runtime.json"
+            self.assertEqual(packaged.runtime_host(root), "0.0.0.0")
+            for host in ("127.0.0.1", "0.0.0.0"):
+                profile.write_text(json.dumps({"host": host}), encoding="utf-8")
+                self.assertEqual(packaged.runtime_host(root), host)
+            for content in (
+                "{", "[]", "{}", '{"host": "localhost"}',
+                '{"host": null}', '{"host": ["127.0.0.1"]}',
+            ):
+                with self.subTest(content=content):
+                    profile.write_text(content, encoding="utf-8")
+                    with self.assertRaises(packaged.RunError) as raised:
+                        packaged.runtime_host(root)
+                    self.assertIn(str(profile), str(raised.exception))
+                    self.assertIn("runtime profile", str(raised.exception))
+            profile.unlink()
+            profile.mkdir()
+            with self.assertRaisesRegex(packaged.RunError, "Cannot read runtime profile"):
+                packaged.runtime_host(root)
+
+    def test_frozen_runtime_profile_follows_executable_after_folder_rename(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "Debug"
+            root.mkdir()
+            (root / "runtime.json").write_text('{"host": "127.0.0.1"}', encoding="utf-8")
+            for name in ("Debug", "RenamedPortable"):
+                with self.subTest(folder=name):
+                    if root.name != name:
+                        root = root.rename(root.with_name(name))
+                    with (
+                        patch.object(packaged.sys, "frozen", True, create=True),
+                        patch.object(packaged.sys, "executable", str(root / "server.exe")),
+                    ):
+                        self.assertEqual(packaged.runtime_directory(), root.resolve())
+                        self.assertEqual(packaged.runtime_host(packaged.runtime_directory()), "127.0.0.1")
+
+    def test_profile_environment_file_process_environment_and_cli_precedence(self) -> None:
+        for profile_host in ("127.0.0.1", "0.0.0.0"):
+            for file_host, process_host, arguments, expected in (
+                (None, None, [], profile_host),
+                ("192.168.1.156", None, [], "192.168.1.156"),
+                ("192.168.1.156", "192.168.1.157", [], "192.168.1.157"),
+                ("192.168.1.156", "192.168.1.157", ["--host", "127.0.0.1"], "127.0.0.1"),
+            ):
+                with self.subTest(profile=profile_host, file=file_host, process=process_host, cli=arguments):
+                    with tempfile.TemporaryDirectory() as directory:
+                        root = Path(directory)
+                        self.make_public(root)
+                        (root / "runtime.json").write_text(json.dumps({"host": profile_host}), encoding="utf-8")
+                        if file_host is not None:
+                            (root / ".env").write_text(f"BACKEND_HOST={file_host}\n", encoding="utf-8")
+                        environment = self.environment()
+                        if process_host is not None:
+                            environment["BACKEND_HOST"] = process_host
+                        with (
+                            patch.dict(os.environ, environment, clear=True),
+                            patch.object(packaged, "runtime_directory", return_value=root),
+                            patch.object(packaged, "bind_listener", side_effect=packaged.RunError("binding checked")) as bind,
+                            self.assertRaisesRegex(packaged.RunError, "binding checked"),
+                        ):
+                            packaged.main(arguments)
+                        bind.assert_called_once_with(expected, 8000, "backend")
+
+    def test_startup_links_follow_binding_and_proxy_uses_local_backend(self) -> None:
+        addresses = ["192.168.1.156", "192.168.56.1"]
+        for host, arguments, expected_addresses in (
+            ("0.0.0.0", [], addresses),
+            ("127.0.0.1", ["--host", "127.0.0.1"], []),
+            ("192.168.1.156", ["--host", "192.168.1.156"], addresses[:1]),
+        ):
+            with self.subTest(host=host), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                self.make_public(root)
+                backend_socket = Mock(spec=socket.socket, family=socket.AF_INET)
+                frontend_socket = Mock(spec=socket.socket, family=socket.AF_INET)
+                backend_socket.getsockname.return_value = (host, 8000)
+                frontend_socket.getsockname.return_value = (host, 3000)
+                output = io.StringIO()
+                with (
+                    patch.dict(os.environ, self.environment(), clear=True),
+                    patch.object(packaged, "runtime_directory", return_value=root),
+                    patch.object(packaged, "bind_listener", side_effect=[backend_socket, frontend_socket]) as bind,
+                    patch("backend.network.discover_lan_ipv4", return_value=addresses),
+                    patch.object(packaged, "create_frontend_app") as frontend_app,
+                    patch.object(packaged, "serve_applications", new=Mock(return_value=object())),
+                    patch.object(packaged.asyncio, "run", return_value=0),
+                    redirect_stdout(output),
+                ):
+                    self.assertEqual(packaged.main(arguments), 0)
+                self.assertEqual(bind.call_args_list[0].args, (host, 8000, "backend"))
+                self.assertEqual(bind.call_args_list[1].args, (host, 3000, "frontend"))
+                local_host = "127.0.0.1" if host == "0.0.0.0" else host
+                frontend_app.assert_called_once_with(root / "public", f"http://{local_host}:8000")
+                lines = output.getvalue().splitlines()
+                self.assertIn("Starting Sample React + Python Full-Stack Services", lines)
+                self.assertIn(f"Frontend: http://{local_host}:3000", lines)
+                self.assertIn(
+                    f"Backend:  http://{local_host}:8000 (API docs: http://{local_host}:8000/docs)",
+                    lines,
+                )
+                self.assertEqual(
+                    [line for line in lines if line.startswith("LAN: ")],
+                    [f"LAN:      http://{address}:3000" for address in expected_addresses],
+                )
+                self.assertEqual(
+                    [line for line in lines if line.startswith("LAN API: ")],
+                    [f"LAN API:  http://{address}:8000/docs" for address in expected_addresses],
+                )
+                backend_socket.close.assert_called_once()
+                frontend_socket.close.assert_called_once()
+
+    def test_release_profile_serves_frontend_and_proxy_over_lan(self) -> None:
+        addresses = discover_lan_ipv4()
+        if not addresses:
+            self.skipTest("No local LAN IPv4 address is available")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "Release"
+            root.mkdir()
+            self.make_public(root)
+            (root / "runtime.json").write_text('{"host": "0.0.0.0"}', encoding="utf-8")
+            frontend, backend = free_ports()
+            with self.running(root, frontend, backend) as client:
+                for address in addresses:
+                    with self.subTest(address=address):
+                        frontend_url = f"http://{address}:{frontend}"
+                        backend_url = f"http://{address}:{backend}"
+                        self.assertIn("Portable frontend", client.get(frontend_url).text)
+                        self.assertEqual(client.get(frontend_url + "/api/health").json(), {"status": "ok"})
+                        self.assertEqual(client.get(backend_url + "/docs").status_code, 200)
+                        count = client.post(frontend_url + "/api/counter/click").json()["count"]
+                        self.assertEqual(client.get(backend_url + "/api/counter").json()["count"], count)
+
+    def test_debug_profile_serves_local_proxy_and_refuses_lan_after_folder_rename(self) -> None:
+        addresses = discover_lan_ipv4()
+        if not addresses:
+            self.skipTest("No local LAN IPv4 address is available")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "Debug"
+            root.mkdir()
+            self.make_public(root)
+            (root / "runtime.json").write_text('{"host": "127.0.0.1"}', encoding="utf-8")
+            root = root.rename(root.with_name("RenamedPortable"))
+            frontend, backend = free_ports()
+            frontend_url = f"http://127.0.0.1:{frontend}"
+            backend_url = f"http://127.0.0.1:{backend}"
+            with self.running(root, frontend, backend) as client:
+                self.assertIn("Portable frontend", client.get(frontend_url).text)
+                self.assertEqual(client.get(frontend_url + "/api/health").json(), {"status": "ok"})
+                count = client.post(frontend_url + "/api/counter/click").json()["count"]
+                self.assertEqual(client.get(backend_url + "/api/counter").json()["count"], count)
+                for address in addresses:
+                    for port in (frontend, backend):
+                        with self.subTest(address=address, port=port):
+                            with self.assertRaises((httpx.ConnectError, httpx.ConnectTimeout)):
+                                client.get(f"http://{address}:{port}/api/health")
 
     def test_separate_ports_proxy_static_files_and_persistent_state(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Build a portable Windows application in dist without replacing user data."""
+"""Build portable Debug (local) and Release (LAN) Windows applications."""
 
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shutil
 import subprocess
@@ -20,7 +21,8 @@ WORK = ROOT / "build"
 LOCAL_VENV = ROOT / ".venv"
 LOCAL_PYTHON = LOCAL_VENV / "Scripts" / "python.exe"
 APPLICATION = "server"
-ARTIFACTS = ("server.exe", "public", "run.bat")
+PROFILES = {"Debug": "127.0.0.1", "Release": "0.0.0.0"}
+ARTIFACTS = ("server.exe", "public", "run.bat", "runtime.json")
 
 LAUNCHER = """@echo off
 setlocal
@@ -102,19 +104,39 @@ def pyinstaller_command(python: Path, stage: Path) -> list[str | Path]:
     return command
 
 
-def validate_artifacts(stage: Path) -> None:
+def prepare_artifacts(stage: Path) -> Path:
+    """Create two portable packages from the shared frontend and executable."""
+    packages = stage / "packages"
+    checked_path(packages, stage)
+    packages.mkdir()
+    for profile, host in PROFILES.items():
+        package = packages / profile
+        checked_path(package, packages)
+        package.mkdir()
+        shutil.copy2(stage / "server.exe", package / "server.exe")
+        shutil.copytree(stage / "public", package / "public")
+        (package / "run.bat").write_text(LAUNCHER, encoding="ascii", newline="\r\n")
+        (package / "runtime.json").write_text(
+            json.dumps({"host": host}, indent=2) + "\n", encoding="ascii",
+        )
+    return packages
+
+
+def validate_artifacts(stage: Path, *, host: str) -> None:
     if not (stage / "server.exe").is_file():
         raise BuildError("PyInstaller did not produce the backend executable")
     if not (stage / "public" / "index.html").is_file():
         raise BuildError("Vite did not produce public/index.html")
+    if json.loads((stage / "runtime.json").read_text(encoding="ascii")) != {"host": host}:
+        raise BuildError(f"Unexpected runtime defaults in {stage}")
     batch_files = [path.relative_to(stage) for path in stage.rglob("*")
                    if path.is_file() and path.suffix.lower() == ".bat"]
     if batch_files != [Path("run.bat")]:
-        raise BuildError(f"Unexpected batch files in release artifacts: {batch_files}")
+        raise BuildError(f"Unexpected batch files in portable artifacts: {batch_files}")
 
 
 def publish_artifacts(stage: Path, *, repository: Path = ROOT) -> None:
-    """Swap only generated artifacts, restoring the previous release on failure."""
+    """Publish both profiles together, preserving their data and local settings."""
     output = repository / "dist"
     checked_path(output, repository)
     checked_path(stage, repository / "build")
@@ -122,40 +144,48 @@ def publish_artifacts(stage: Path, *, repository: Path = ROOT) -> None:
     previous = stage / "previous"
     checked_path(previous, stage)
     previous.mkdir()
-    installed: list[str] = []
-    backed_up: list[str] = []
+    installed: list[tuple[str, str]] = []
+    backed_up: list[tuple[str, str]] = []
     # Check every mutation target before moving anything. In particular, a
     # junction used for one output must not leave another output half updated.
-    for name in ARTIFACTS:
-        checked_path(stage / name, stage)
-        checked_path(output / name, output)
-        checked_path(previous / name, previous)
-    try:
+    for profile in PROFILES:
+        checked_path(stage / profile, stage)
+        checked_path(output / profile, output)
+        checked_path(previous / profile, previous)
         for name in ARTIFACTS:
-            source = stage / name
-            target = output / name
-            backup = previous / name
-            checked_path(source, stage)
-            checked_path(target, output)
-            checked_path(backup, previous)
-            if target.exists():
-                target.rename(backup)
-                backed_up.append(name)
-            source.rename(target)
-            installed.append(name)
+            checked_path(stage / profile / name, stage / profile)
+            checked_path(output / profile / name, output / profile)
+            checked_path(previous / profile / name, previous / profile)
+    for profile in PROFILES:
+        (output / profile).mkdir(exist_ok=True)
+        (previous / profile).mkdir()
+    try:
+        for profile in PROFILES:
+            for name in ARTIFACTS:
+                source = stage / profile / name
+                target = output / profile / name
+                backup = previous / profile / name
+                checked_path(source, stage / profile)
+                checked_path(target, output / profile)
+                checked_path(backup, previous / profile)
+                if target.exists():
+                    target.rename(backup)
+                    backed_up.append((profile, name))
+                source.rename(target)
+                installed.append((profile, name))
     except OSError as error:
-        # Keep the last usable release if a running executable or another locked
-        # artifact prevents replacing it. User state under dist is never moved.
-        for name in reversed(installed):
-            target = output / name
-            checked_path(target, output)
-            target.rename(stage / name)
-        for name in reversed(backed_up):
-            backup = previous / name
-            checked_path(backup, previous)
-            backup.rename(output / name)
+        # A locked artifact in either profile restores both previous packages.
+        # User state in each distribution is never moved.
+        for profile, name in reversed(installed):
+            target = output / profile / name
+            checked_path(target, output / profile)
+            target.rename(stage / profile / name)
+        for profile, name in reversed(backed_up):
+            backup = previous / profile / name
+            checked_path(backup, previous / profile)
+            backup.rename(output / profile / name)
         raise BuildError(
-            "Could not replace release artifacts; close the running application "
+            "Could not replace Debug/Release artifacts; close the running application "
             f"and retry. {error}"
         ) from error
 
@@ -199,15 +229,11 @@ def main(argv: list[str] | None = None) -> int:
         frozen = stage / "frozen" / f"{APPLICATION}.exe"
         checked_path(frozen, stage)
         frozen.rename(stage / "server.exe")
-        (stage / "run.bat").write_text(LAUNCHER, encoding="ascii", newline="\r\n")
-        # Validate the release folders rather than PyInstaller's work/spec files.
-        artifacts = stage / "release"
-        checked_path(artifacts, stage)
-        artifacts.mkdir()
-        for name in ARTIFACTS:
-            (stage / name).rename(artifacts / name)
-        validate_artifacts(artifacts)
-        run([artifacts / "server.exe", "--help"])
+        # Validate both portable folders rather than PyInstaller's work/spec files.
+        artifacts = prepare_artifacts(stage)
+        for profile, host in PROFILES.items():
+            validate_artifacts(artifacts / profile, host=host)
+            run([artifacts / profile / "server.exe", "--help"])
         publish_artifacts(artifacts)
         published = True
     finally:
@@ -217,8 +243,9 @@ def main(argv: list[str] | None = None) -> int:
         else:
             print(f"[build] Build files retained for troubleshooting: {stage}")
 
-    print(f"\n[build] Ready: {OUTPUT}")
-    print("[build] Run: dist\\run.bat --frontend 4000 --backend 9000")
+    print(f"\n[build] Ready: {OUTPUT / 'Debug'} (local) and {OUTPUT / 'Release'} (LAN)")
+    print("[build] Local: dist\\Debug\\run.bat --frontend 4000 --backend 9000")
+    print("[build] LAN:   dist\\Release\\run.bat --frontend 4000 --backend 9000")
     return 0
 
 
