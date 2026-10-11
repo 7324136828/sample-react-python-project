@@ -27,6 +27,7 @@ const python = environmentPython && existsSync(environmentPython)
 const backendUrl = 'http://127.0.0.1:8001';
 const frontendUrl = 'http://127.0.0.1:5174';
 const testDatabase = join(e2eRoot, 'test-results', 'counter.db');
+const testSettingsRoot = join(e2eRoot, 'test-results', 'settings');
 const environment = Object.fromEntries(
   Object.entries(process.env).filter(
     (entry): entry is [string, string] => entry[1] !== undefined,
@@ -65,6 +66,8 @@ export default defineConfig({
       cwd: projectRoot,
       env: {
         ...environment,
+        APPDATA: testSettingsRoot,
+        XDG_CONFIG_HOME: testSettingsRoot,
         COUNTER_DB_PATH: testDatabase,
         CORS_ORIGINS: frontendUrl,
       },

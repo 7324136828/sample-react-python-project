@@ -33,7 +33,7 @@ class RunError(RuntimeError):
 
 def runtime_directory() -> Path:
     # A one-file executable extracts its Python modules to a temporary directory.
-    # Public files and user state belong beside server.exe, outside that directory.
+    # Public files belong beside server.exe, outside that directory.
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parents[1] / "dist"
@@ -50,11 +50,14 @@ def load_environment(root: Path) -> None:
             if key.strip():
                 os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
 
-    database = Path(os.environ.get("COUNTER_DB_PATH", "data/counter.db")).expanduser()
-    if not database.is_absolute():
-        database = root / database
-    # Set this before importing the backend: its module creates the app on import.
-    os.environ["COUNTER_DB_PATH"] = str(database.resolve())
+    configured = os.environ.get("COUNTER_DB_PATH")
+    if configured and configured.strip():
+        database = Path(os.path.expandvars(configured)).expanduser()
+        if not database.is_absolute():
+            database = root / database
+        os.environ["COUNTER_DB_PATH"] = str(database.resolve())
+    elif configured is not None:
+        os.environ.pop("COUNTER_DB_PATH")
 
 
 def runtime_host(root: Path) -> str:
@@ -278,8 +281,15 @@ def main(argv: list[str] | None = None) -> int:
         frontend_socket = bind_listener(options.host, options.frontend_port, "frontend")
         if not getattr(sys, "frozen", False):
             sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-        from backend.app.main import app
+        from backend.app.main import create_app
         from backend.network import lan_urls
+        from backend.settings import SettingsError, configured_database_path, settings_path
+
+        try:
+            database = configured_database_path(root)
+        except SettingsError as error:
+            raise RunError(str(error)) from error
+        app = create_app(database)
 
         backend_url = listener_url(backend_socket)
         frontend_url = listener_url(frontend_socket)
@@ -297,7 +307,8 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"LAN API:  {api_url}/docs")
         if frontend_lan_urls:
             print("Open a LAN URL on another device connected to the same network.")
-        print(f"Database: {os.environ['COUNTER_DB_PATH']}")
+        print(f"Settings: {settings_path()}")
+        print(f"Database: {database}")
         print("[run] Press Ctrl+C to stop both services.", flush=True)
         return asyncio.run(serve_applications(app, frontend, backend_socket, frontend_socket))
     finally:

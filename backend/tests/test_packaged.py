@@ -41,21 +41,34 @@ def free_ports() -> tuple[int, int]:
 
 
 class PackagedRuntimeTests(unittest.TestCase):
+    def setUp(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.settings_root = Path(directory.name)
+        (self.settings_root / "temp").mkdir()
+
     def environment(self) -> dict[str, str]:
         environment = os.environ.copy()
         for name in ("BACKEND_PORT", "FRONTEND_PORT", "BACKEND_HOST", "COUNTER_DB_PATH"):
             environment.pop(name, None)
+        environment.update({
+            "APPDATA": str(self.settings_root / "appdata"),
+            "XDG_CONFIG_HOME": str(self.settings_root / "appdata"),
+            "TEMP": str(self.settings_root / "temp"),
+            "TMP": str(self.settings_root / "temp"),
+            "TMPDIR": str(self.settings_root / "temp"),
+        })
         return environment
 
     def command(self, root: Path, *arguments: str) -> list[str]:
         return [sys.executable, "-c", ENTRYPOINT, str(PROJECT_ROOT), str(root), *arguments]
 
     @contextmanager
-    def running(self, root: Path, frontend: int, backend: int):
+    def running(self, root: Path, frontend: int, backend: int, *, cwd: Path | None = None):
         with tempfile.TemporaryFile(mode="w+b") as log:
             process = subprocess.Popen(
                 self.command(root, "--frontend", str(frontend), "--backend-port", str(backend)),
-                cwd=root, env=self.environment(), stdout=log, stderr=subprocess.STDOUT,
+                cwd=cwd or root, env=self.environment(), stdout=log, stderr=subprocess.STDOUT,
                 creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
             )
             try:
@@ -88,6 +101,25 @@ class PackagedRuntimeTests(unittest.TestCase):
         (root / "public").mkdir()
         (root / "public" / "index.html").write_text("<h1>Portable frontend</h1>")
         (root / ".env").write_text("COUNTER_DB_PATH=data/portable.db\n")
+
+    def test_database_override_expands_environment_and_blank_uses_settings(self) -> None:
+        root = self.settings_root
+        storage = root / "selected data"
+        variable = "%COUNTER_STORAGE_TEST%" if os.name == "nt" else "$COUNTER_STORAGE_TEST"
+        environment = self.environment()
+        environment.update({
+            "COUNTER_STORAGE_TEST": str(storage),
+            "COUNTER_DB_PATH": variable + "/counter.db",
+        })
+        with patch.dict(os.environ, environment, clear=True):
+            packaged.load_environment(root)
+            self.assertEqual(os.environ["COUNTER_DB_PATH"], str((storage / "counter.db").resolve()))
+        for value in ("", " \t "):
+            with self.subTest(value=value), patch.dict(
+                os.environ, {**self.environment(), "COUNTER_DB_PATH": value}, clear=True,
+            ):
+                packaged.load_environment(root)
+                self.assertNotIn("COUNTER_DB_PATH", os.environ)
 
     def test_default_lan_and_explicit_bind_configuration(self) -> None:
         with patch.dict(os.environ, self.environment(), clear=True):
@@ -280,6 +312,88 @@ class PackagedRuntimeTests(unittest.TestCase):
                 frontend_url = f"http://127.0.0.1:{frontend}"
                 self.assertEqual(client.get(frontend_url + "/api/counter").json()["count"], 1)
                 self.assertEqual(client.delete(frontend_url + "/api/counter").json()["count"], 0)
+
+    def test_default_storage_survives_restart_and_distribution_folder_change(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            root = workspace / "Debug"
+            root.mkdir()
+            self.make_public(root)
+            (root / ".env").unlink()
+            (root / "runtime.json").write_text('{"host": "127.0.0.1"}', encoding="utf-8")
+            settings = self.settings_root / "appdata" / "sample-react-python-project" / "settings.json"
+            database = self.settings_root / "temp" / "sample-react-python-project" / "counter.db"
+            frontend, backend = free_ports()
+            with self.running(root, frontend, backend, cwd=workspace) as client:
+                url = f"http://127.0.0.1:{frontend}/api/counter"
+                self.assertEqual(client.get(url).json()["count"], 0)
+                self.assertEqual(client.post(url + "/click").json()["count"], 1)
+            original_settings = settings.read_text(encoding="utf-8")
+            self.assertTrue(database.is_file())
+            self.assertFalse((root / "data").exists())
+
+            root = root.rename(workspace / "Release")
+            (root / "runtime.json").write_text('{"host": "0.0.0.0"}', encoding="utf-8")
+            frontend, backend = free_ports()
+            with self.running(root, frontend, backend, cwd=workspace) as client:
+                self.assertEqual(
+                    client.get(f"http://127.0.0.1:{frontend}/api/counter").json()["count"], 1,
+                )
+            self.assertEqual(settings.read_text(encoding="utf-8"), original_settings)
+
+    def test_settings_select_custom_storage_across_restarts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            root = workspace / "distribution"
+            root.mkdir()
+            self.make_public(root)
+            (root / ".env").unlink()
+            settings = self.settings_root / "appdata" / "sample-react-python-project" / "settings.json"
+            settings.parent.mkdir(parents=True)
+            storage = workspace / "selected data" / "nested"
+            content = json.dumps({"data_directory": str(storage), "custom_setting": "preserved"})
+            settings.write_text(content, encoding="utf-8")
+            for expected_count in (0, 1):
+                frontend, backend = free_ports()
+                with self.running(root, frontend, backend, cwd=workspace) as client:
+                    url = f"http://127.0.0.1:{frontend}/api/counter"
+                    self.assertEqual(client.get(url).json()["count"], expected_count)
+                    if expected_count == 0:
+                        self.assertEqual(client.post(url + "/click").json()["count"], 1)
+            self.assertTrue((storage / "counter.db").is_file())
+            self.assertEqual(settings.read_text(encoding="utf-8"), content)
+
+    def test_invalid_settings_report_clear_error_and_release_ports(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_public(root)
+            settings = self.settings_root / "appdata" / "sample-react-python-project" / "settings.json"
+            settings.parent.mkdir(parents=True)
+            settings.write_text("{", encoding="utf-8")
+            frontend, backend = free_ports()
+            completed = subprocess.run(
+                self.command(root, "--frontend", str(frontend), "--backend", str(backend)),
+                cwd=root, env=self.environment(), capture_output=True, text=True, timeout=15,
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+            )
+            self.assertEqual(completed.returncode, 1)
+            self.assertIn(str(settings), completed.stderr)
+            self.assertNotIn("Traceback", completed.stderr)
+            self.assertEqual(settings.read_text(encoding="utf-8"), "{")
+            for port in (frontend, backend):
+                with socket.socket() as released:
+                    released.bind(("127.0.0.1", port))
+
+    def test_help_does_not_create_user_settings(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            completed = subprocess.run(
+                self.command(Path(directory), "--help"), env=self.environment(),
+                capture_output=True, text=True, timeout=15,
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+            )
+            self.assertEqual(completed.returncode, 0)
+            self.assertIn("usage:", completed.stdout)
+            self.assertFalse((self.settings_root / "appdata").exists())
 
     def test_busy_frontend_port_fails_and_releases_backend_port(self) -> None:
         with tempfile.TemporaryDirectory() as directory, socket.socket() as busy:

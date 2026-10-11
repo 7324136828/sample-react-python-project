@@ -10,6 +10,8 @@ from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ConfigDict
 
+from backend.settings import configured_database_path as resolve_database_path
+
 from .store import CounterState, CounterStore
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -23,8 +25,7 @@ class CounterResponse(BaseModel):
 
 
 def configured_database_path() -> Path:
-    configured = Path(os.environ.get("COUNTER_DB_PATH", "data/counter.db")).expanduser()
-    return configured if configured.is_absolute() else PROJECT_ROOT / configured
+    return resolve_database_path(PROJECT_ROOT)
 
 
 def configured_cors_origins() -> list[str]:
@@ -39,10 +40,11 @@ def get_store(request: Request) -> CounterStore:
 
 
 def create_app(database_path: Path | None = None) -> FastAPI:
-    store = CounterStore(database_path or configured_database_path())
-
     @asynccontextmanager
     async def lifespan(application: FastAPI):
+        store = CounterStore(
+            database_path if database_path is not None else configured_database_path()
+        )
         store.initialize()
         application.state.counter_store = store
         yield

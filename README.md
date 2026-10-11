@@ -75,16 +75,50 @@ their settings; change an existing loopback value to `0.0.0.0` to enable LAN.
 
 ## Configuration
 
+On Windows, the backend creates
+`%APPDATA%/sample-react-python-project/settings.json` on its first startup.
+Its `data_directory` setting defaults to the resolved
+`%TEMP%/sample-react-python-project` folder, and the SQLite database is stored
+there as `counter.db`. Development, Debug, and Release use the same settings
+and data for the current Windows user.
+
+To choose a storage folder, edit `settings.json` and restart the application:
+
+```json
+{
+  "data_directory": "D:/CounterData"
+}
+```
+
+The folder is created when needed. Environment variables and `~` are expanded
+using the platform's path conventions; relative paths resolve from the folder
+containing `settings.json`. Unknown settings are preserved. Invalid JSON or an
+invalid `data_directory` stops startup with an error.
+
+Temporary folders can be cleared by the operating system, so choose a permanent
+folder for data you want to retain. Existing databases are not moved
+automatically. With the application stopped, copy or move an existing
+`counter.db` into the chosen folder, or point `COUNTER_DB_PATH` at the old file.
+
+On Linux and macOS, settings are stored under
+`$XDG_CONFIG_HOME/sample-react-python-project/settings.json`, or
+`~/.config/sample-react-python-project/settings.json` when `XDG_CONFIG_HOME` is
+unset. The data folder defaults to `sample-react-python-project` under `TEMP`,
+or the system temporary directory when `TEMP` is unset.
+
 Copy `.env.example` to `.env` to customize the preferred ports, bind address,
-or database path. Environment variables already defined in the terminal take
-precedence over values in `.env`.
+or explicitly override the database file. Environment variables already
+defined in the terminal take precedence over values in `.env`.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `BACKEND_PORT` | `8000` | First backend port to try |
 | `FRONTEND_PORT` | `5173` | First frontend port to try |
 | `BACKEND_HOST` | `0.0.0.0` | Bind address for both frontend and backend |
-| `COUNTER_DB_PATH` | `data/counter.db` | Persistent SQLite database |
+| `COUNTER_DB_PATH` | Unset | Override the settings-based SQLite database path |
+
+Relative `COUNTER_DB_PATH` overrides resolve from the project root in
+development, or beside `server.exe` in a packaged build.
 
 ## API
 
@@ -148,12 +182,12 @@ selected backend port, so changing ports does not require rebuilding React.
 An optional `.env` beside each `server.exe` supports `FRONTEND_PORT`,
 `BACKEND_PORT`, `BACKEND_HOST`, and `COUNTER_DB_PATH`; command-line ports take
 precedence. For the bind address, `--host` takes precedence over `BACKEND_HOST`,
-which takes precedence over the generated `runtime.json` default. The counter
-database defaults to `data/counter.db` in each distribution folder. Relative
-database paths resolve beside `server.exe`, regardless of the launcher's working
-directory. Each folder has separate settings and counter data. Rebuilding
-replaces `public`, `server.exe`, `run.bat`, and `runtime.json` while preserving
-each folder's existing data and `.env`.
+which takes precedence over the generated `runtime.json` default. Both
+distributions use the per-user `settings.json` and data directory described
+above. Relative `COUNTER_DB_PATH` overrides resolve beside `server.exe`,
+regardless of the launcher's working directory. Rebuilding replaces `public`,
+`server.exe`, `run.bat`, and `runtime.json` while preserving each folder's `.env`
+and any existing data files.
 
 Development checks:
 
@@ -187,7 +221,6 @@ npm run install:webkit
 backend/                  FastAPI application, SQLite store, and unit tests
 frontend/                 TypeScript React/Vite application
 e2e/                      Standalone TypeScript Playwright end-to-end tests
-data/                     Runtime database location (database is ignored)
 setup.py / setup.*        Cross-platform dependency setup
 run.py / run.*            Combined backend/frontend runner
 build.py / build.bat      Portable Windows distribution builder
